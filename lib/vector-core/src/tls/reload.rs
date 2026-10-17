@@ -38,6 +38,10 @@ impl TlsAcceptorReloader {
 
     /// Swap in a freshly built acceptor from `settings`. New connections pick it up
     /// immediately; the previous acceptor is dropped once its last in-flight handshake completes.
+    ///
+    /// The client certificate verifier is replaced too. If `settings` has no verifier, the new
+    /// acceptor has none. To keep a verifier across reloads, attach it to `settings` each time
+    /// with [`TlsSettings::with_client_cert_verifier`].
     pub fn reload(&self, settings: &TlsSettings) -> crate::tls::Result<()> {
         self.acceptor.store(Arc::new(settings.acceptor()?));
         Ok(())
@@ -71,7 +75,7 @@ impl MaybeTlsSettings {
     ///
     /// Pass the returned handle to [`bind_reloadable`](Self::bind_reloadable) so the bound listener
     /// serves it, and keep a clone to call [`reload`](TlsAcceptorReloader::reload) when the
-    /// certificate material rotates.
+    /// certificate material rotates. Each reload replaces the client certificate verifier too.
     pub fn reloadable_acceptor(&self) -> crate::tls::Result<Option<TlsAcceptorReloader>> {
         match self {
             Self::Tls(tls) => Ok(Some(TlsAcceptorReloader::new(tls.acceptor()?))),
@@ -85,17 +89,15 @@ mod test {
     use std::{net::SocketAddr, pin::Pin};
 
     use openssl::{
-        asn1::Asn1Time,
-        bn::{BigNum, MsbOption},
-        hash::MessageDigest,
-        nid::Nid,
-        pkey::PKey,
-        rsa::Rsa,
+        pkey::{PKeyRef, Private},
         ssl::{SslConnector, SslMethod, SslVerifyMode},
-        x509::{X509, X509NameBuilder},
+        x509::X509Ref,
     };
 
-    use crate::tls::{MaybeTls, MaybeTlsSettings, TlsConfig, TlsEnableableConfig, TlsError};
+    use crate::tls::{
+        MaybeTls, MaybeTlsSettings, TlsConfig, TlsEnableableConfig, TlsError,
+        test_util::{extract_common_name, self_signed_ca},
+    };
 
     #[test]
     fn no_reloadable_acceptor_without_tls() {
@@ -167,8 +169,8 @@ mod test {
     /// served the new one.
     #[tokio::test]
     async fn served_certificate_changes_after_reload() {
-        let (crt_a, key_a) = self_signed("old.example");
-        let (crt_b, key_b) = self_signed("new.example");
+        let (crt_a, key_a) = self_signed_ca("old.example");
+        let (crt_b, key_b) = self_signed_ca("new.example");
 
         let settings = server_settings(&crt_a, &key_a);
         let reloader = settings
@@ -225,18 +227,14 @@ mod test {
             .ssl()
             .peer_certificate()
             .expect("server presents a certificate");
-        cert.subject_name()
-            .entries_by_nid(Nid::COMMONNAME)
-            .next()
-            .unwrap()
-            .data()
-            .to_string()
-            .unwrap()
+        extract_common_name(&cert)
     }
 
-    fn server_settings(crt_pem: &str, key_pem: &str) -> MaybeTlsSettings {
+    fn server_settings(crt: &X509Ref, key: &PKeyRef<Private>) -> MaybeTlsSettings {
         // `crt_file`/`key_file` accept inline PEM (detected by the `-----BEGIN ` marker), so no
         // temp files are needed.
+        let crt_pem = String::from_utf8(crt.to_pem().unwrap()).unwrap();
+        let key_pem = String::from_utf8(key.private_key_to_pem_pkcs8().unwrap()).unwrap();
         let config = TlsEnableableConfig {
             enabled: Some(true),
             options: TlsConfig {
@@ -246,39 +244,5 @@ mod test {
             },
         };
         MaybeTlsSettings::from_config(Some(&config), true).unwrap()
-    }
-
-    /// Generate a self-signed certificate/key pair (PEM) with the given common name.
-    fn self_signed(common_name: &str) -> (String, String) {
-        let key = PKey::from_rsa(Rsa::generate(2048).unwrap()).unwrap();
-
-        let mut name = X509NameBuilder::new().unwrap();
-        name.append_entry_by_text("CN", common_name).unwrap();
-        let name = name.build();
-
-        let mut serial = BigNum::new().unwrap();
-        serial.rand(128, MsbOption::MAYBE_ZERO, false).unwrap();
-
-        let mut builder = X509::builder().unwrap();
-        builder.set_version(2).unwrap();
-        builder
-            .set_serial_number(&serial.to_asn1_integer().unwrap())
-            .unwrap();
-        builder.set_subject_name(&name).unwrap();
-        builder.set_issuer_name(&name).unwrap();
-        builder.set_pubkey(&key).unwrap();
-        builder
-            .set_not_before(&Asn1Time::days_from_now(0).unwrap())
-            .unwrap();
-        builder
-            .set_not_after(&Asn1Time::days_from_now(1).unwrap())
-            .unwrap();
-        builder.sign(&key, MessageDigest::sha256()).unwrap();
-        let cert = builder.build();
-
-        (
-            String::from_utf8(cert.to_pem().unwrap()).unwrap(),
-            String::from_utf8(key.private_key_to_pem_pkcs8().unwrap()).unwrap(),
-        )
     }
 }
